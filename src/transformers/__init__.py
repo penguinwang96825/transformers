@@ -1335,7 +1335,11 @@ else:
     _import_structure["models.audio_spectrogram_transformer"].extend(
         [
             "ASTForAudioClassification",
+            "ASDeiTForAudioClassification", 
+            "ASViTForAudioClassification", 
             "ASTModel",
+            "ASDeiTModel", 
+            "ASViTModel", 
             "ASTPreTrainedModel",
         ]
     )
@@ -6040,7 +6044,11 @@ if TYPE_CHECKING:
         )
         from .models.audio_spectrogram_transformer import (
             ASTForAudioClassification,
+            ASDeiTForAudioClassification, 
+            ASViTForAudioClassification, 
             ASTModel,
+            ASDeiTModel, 
+            ASViTModel, 
             ASTPreTrainedModel,
         )
         from .models.auto import (

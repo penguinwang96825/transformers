@@ -29,7 +29,11 @@ except OptionalDependencyNotAvailable:
 else:
     _import_structure["modeling_audio_spectrogram_transformer"] = [
         "ASTForAudioClassification",
+        "ASDeiTForAudioClassification", 
+        "ASViTForAudioClassification", 
         "ASTModel",
+        "ASDeiTModel", 
+        "ASViTModel", 
         "ASTPreTrainedModel",
     ]
 
@@ -48,7 +52,11 @@ if TYPE_CHECKING:
     else:
         from .modeling_audio_spectrogram_transformer import (
             ASTForAudioClassification,
+            ASDeiTForAudioClassification, 
+            ASViTForAudioClassification, 
             ASTModel,
+            ASDeiTModel, 
+            ASViTModel, 
             ASTPreTrainedModel,
         )
 
