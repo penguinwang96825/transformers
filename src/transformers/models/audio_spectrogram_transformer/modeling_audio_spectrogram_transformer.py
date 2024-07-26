@@ -84,6 +84,82 @@ class ASTEmbeddings(nn.Module):
         return embeddings
 
 
+class ASDeiTEmbeddings(nn.Module):
+    """
+    Construct the CLS token, position and patch embeddings.
+    """
+
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__()
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.distillation_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.patch_embeddings = ASTPatchEmbeddings(config)
+
+        frequency_out_dimension, time_out_dimension = self.get_shape(config)
+        num_patches = frequency_out_dimension * time_out_dimension
+        self.position_embeddings = nn.Parameter(torch.zeros(1, num_patches + 2, config.hidden_size))
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.config = config
+
+    def get_shape(self, config):
+        # see Karpathy's cs231n blog on how to calculate the output dimensions
+        # https://cs231n.github.io/convolutional-networks/#conv
+        frequency_out_dimension = (config.num_mel_bins - config.patch_size) // config.frequency_stride + 1
+        time_out_dimension = (config.max_length - config.patch_size) // config.time_stride + 1
+
+        return frequency_out_dimension, time_out_dimension
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        batch_size = input_values.shape[0]
+        embeddings = self.patch_embeddings(input_values)
+
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        distillation_tokens = self.distillation_token.expand(batch_size, -1, -1)
+        embeddings = torch.cat((cls_tokens, distillation_tokens, embeddings), dim=1)
+        embeddings = embeddings + self.position_embeddings
+        embeddings = self.dropout(embeddings)
+
+        return embeddings
+
+
+class ASViTEmbeddings(nn.Module):
+    """
+    Construct the CLS token, position and patch embeddings.
+    """
+
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__()
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.patch_embeddings = ASTPatchEmbeddings(config)
+
+        frequency_out_dimension, time_out_dimension = self.get_shape(config)
+        num_patches = frequency_out_dimension * time_out_dimension
+        self.position_embeddings = nn.Parameter(torch.zeros(1, num_patches + 2, config.hidden_size))
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.config = config
+
+    def get_shape(self, config):
+        # see Karpathy's cs231n blog on how to calculate the output dimensions
+        # https://cs231n.github.io/convolutional-networks/#conv
+        frequency_out_dimension = (config.num_mel_bins - config.patch_size) // config.frequency_stride + 1
+        time_out_dimension = (config.max_length - config.patch_size) // config.time_stride + 1
+
+        return frequency_out_dimension, time_out_dimension
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        batch_size = input_values.shape[0]
+        embeddings = self.patch_embeddings(input_values)
+
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        embeddings = torch.cat((cls_tokens, embeddings), dim=1)
+        embeddings = embeddings + self.position_embeddings
+        embeddings = self.dropout(embeddings)
+
+        return embeddings
+
+
 class ASTPatchEmbeddings(nn.Module):
     """
     This class turns `input_values` into the initial `hidden_states` (patch embeddings) of shape `(batch_size,
@@ -552,6 +628,170 @@ class ASTModel(ASTPreTrainedModel):
         )
 
 
+class ASDeiTModel(ASTPreTrainedModel):
+
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__(config)
+        self.config = config
+
+        self.embeddings = ASDeiTEmbeddings(config)
+        self.encoder = ASTEncoder(config)
+
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self) -> ASTPatchEmbeddings:
+        return self.embeddings.patch_embeddings
+
+    def _prune_heads(self, heads_to_prune: Dict[int, List[int]]) -> None:
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
+        """
+        for layer, heads in heads_to_prune.items():
+            self.encoder.layer[layer].attention.prune_heads(heads)
+
+    @add_start_docstrings_to_model_forward(AUDIO_SPECTROGRAM_TRANSFORMER_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=BaseModelOutputWithPooling,
+        config_class=_CONFIG_FOR_DOC,
+        modality="audio",
+        expected_output=_EXPECTED_OUTPUT_SHAPE,
+    )
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_values is None:
+            raise ValueError("You have to specify input_values")
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        embedding_output = self.embeddings(input_values)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        sequence_output = self.layernorm(sequence_output)
+
+        pooled_output = (sequence_output[:, 0] + sequence_output[:, 1]) / 2
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+
+class ASViTModel(ASTPreTrainedModel):
+
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__(config)
+        self.config = config
+
+        self.embeddings = ASViTEmbeddings(config)
+        self.encoder = ASTEncoder(config)
+
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self) -> ASTPatchEmbeddings:
+        return self.embeddings.patch_embeddings
+
+    def _prune_heads(self, heads_to_prune: Dict[int, List[int]]) -> None:
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
+        """
+        for layer, heads in heads_to_prune.items():
+            self.encoder.layer[layer].attention.prune_heads(heads)
+
+    @add_start_docstrings_to_model_forward(AUDIO_SPECTROGRAM_TRANSFORMER_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=BaseModelOutputWithPooling,
+        config_class=_CONFIG_FOR_DOC,
+        modality="audio",
+        expected_output=_EXPECTED_OUTPUT_SHAPE,
+    )
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_values is None:
+            raise ValueError("You have to specify input_values")
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        embedding_output = self.embeddings(input_values)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        sequence_output = self.layernorm(sequence_output)
+
+        pooled_output = sequence_output[:, 0]
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+
 class ASTMLPHead(nn.Module):
     def __init__(self, config: ASTConfig):
         super().__init__()
@@ -572,6 +812,178 @@ class ASTMLPHead(nn.Module):
     AUDIO_SPECTROGRAM_TRANSFORMER_START_DOCSTRING,
 )
 class ASTForAudioClassification(ASTPreTrainedModel):
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__(config)
+
+        self.num_labels = config.num_labels
+        self.audio_spectrogram_transformer = ASTModel(config)
+
+        # Classifier head
+        self.classifier = ASTMLPHead(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(AUDIO_SPECTROGRAM_TRANSFORMER_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        checkpoint=_SEQ_CLASS_CHECKPOINT,
+        output_type=SequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        modality="audio",
+        expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
+        expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
+    )
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple, SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the audio classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.audio_spectrogram_transformer(
+            input_values,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = outputs[1]
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class ASDeiTForAudioClassification(ASTPreTrainedModel):
+
+    def __init__(self, config: ASTConfig) -> None:
+        super().__init__(config)
+
+        self.num_labels = config.num_labels
+        self.audio_spectrogram_transformer = ASTModel(config)
+
+        # Classifier head
+        self.classifier = ASTMLPHead(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(AUDIO_SPECTROGRAM_TRANSFORMER_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        checkpoint=_SEQ_CLASS_CHECKPOINT,
+        output_type=SequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        modality="audio",
+        expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
+        expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
+    )
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple, SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the audio classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.audio_spectrogram_transformer(
+            input_values,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = outputs[1]
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class ASViTForAudioClassification(ASTPreTrainedModel):
+
     def __init__(self, config: ASTConfig) -> None:
         super().__init__(config)
 
